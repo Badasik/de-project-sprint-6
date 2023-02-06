@@ -3,22 +3,38 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.decorators import dag
 import pendulum
+from airflow.models import Variable
+import logging
+import vertica_python
 import pandas as pd
 import boto3
-import vertica_python
-import logging
-from airflow.operators.dummy_operator import DummyOperator
 
 conn_info = {'host': '51.250.75.20', 
              'port': 5433,
              'user': 'BADASOVANTYANDEXRU', # логин       
-             'password': 'sxcAyXboOp1vlM4', # пароль
+             'password': Variable.get("PASSWORD_S3"), # пароль
              'database': 'dwh',
              'autocommit': True }
 
 AWS_ACCESS_KEY_ID = "YCAJEWXOyY8Bmyk2eJL-hlt2K"
 AWS_SECRET_ACCESS_KEY = "YCPs52ajb2jNXxOUsL4-pFDL1HnV2BCPd928_ZoA"
 
+
+def fetch_s3_file(bucket: str, keys: list):
+    session = boto3.session.Session()
+    s3_client = session.client(
+    service_name='s3',
+    endpoint_url='https://storage.yandexcloud.net',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    )
+
+    for key in keys:
+        s3_client.download_file(
+        Bucket='sprint6',
+        Key=key,
+        Filename=f'/data/{key}'
+    )
 
 def load_in_stg(key: str, schema: str):
     df_tmp = pd.read_csv(f'/data/{key}.csv')
@@ -65,20 +81,42 @@ def load_in_stg(key: str, schema: str):
 
     logging.info('Finish loading')
 
+def run_sql_file(path: str):
+    logging.info('Start')
+    script_name = path
+    conn = vertica_python.connect(**conn_info)   
+    cur = conn.cursor()
+    cur.execute(open(script_name, 'r').read())
+    conn.commit()
+    
+    logging.info('Finish')
 
+###  
+  
 @dag(schedule_interval=None, start_date=pendulum.parse('2022-07-13'))
+def sprint6_dag_load_group_log():
+    bucket_files = ['group_log.csv']
 
-def sprint6_dag_get_data_group_log():
-    start = DummyOperator(task_id = 'Start')
+    download_csv = PythonOperator(
+        task_id=f'fetch_files',
+        python_callable=fetch_s3_file,
+        op_kwargs={'bucket': 'data-bucket', 'keys': bucket_files},
+    )
 
     load_groups_log = PythonOperator(
         task_id='load_group_log',
         python_callable=load_in_stg,
         op_kwargs={'key': 'group_log', 'schema': 'BADASOVANTYANDEXRU__STAGING'}
     )
+    
+    load_l_user_activity_group = PythonOperator(task_id='load_l_user_activity_group',
+                                                python_callable=run_sql_file,
+                                                op_kwargs={'path': '/src/sql/load_l_user_group_activity.sql'})
+    
+    load_s_auth_history = PythonOperator(task_id='load_s_auth_history',
+                                                python_callable=run_sql_file,
+                                                op_kwargs={'path': '/src/sql/load_s_auth_history.sql'})
 
-    end = DummyOperator(task_id="end")
+    download_csv >> load_groups_log >> load_l_user_activity_group >> load_s_auth_history
 
-    start >> load_groups_log >> end
-
-dag = sprint6_dag_get_data_group_log()
+dag = sprint6_dag_load_group_log()
